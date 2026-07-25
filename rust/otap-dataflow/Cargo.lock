@@ -7369,6 +7369,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "slotmap",
  "smallvec",
  "tempfile",
@@ -7467,6 +7468,7 @@ version = "0.50.0"
 dependencies = [
  "arc-swap",
  "arrow",
+ "arrow-ipc",
  "async-trait",
  "azure_core 1.2.0-beta.1",
  "azure_identity 1.1.0-beta.1",

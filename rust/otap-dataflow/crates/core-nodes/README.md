@@ -100,6 +100,7 @@ Exporters send data out of a pipeline.
 
 | Type                                                               | Feature | Stability    | Description                                                 |
 | ------------------------------------------------------------------ | ------- | ------------ | ----------------------------------------------------------- |
+| [`exporter:arrow`](src/exporters/arrow_exporter/README.md)         | default | experimental | Writes OTAP batches as Arrow IPC files.                     |
 | [`exporter:console`](src/exporters/console_exporter/README.md)     | default | experimental | Prints OTLP logs, metrics, and traces for local inspection. |
 | [`exporter:error`](src/exporters/error_exporter/README.md)         | default | experimental | Rejects every received message with a configured NACK.      |
 | [`exporter:noop`](src/exporters/noop_exporter/README.md)           | default | experimental | Acknowledges and discards every received message.           |

@@ -16,6 +16,7 @@ use otap_df_config::observed_state::{ObservedStateSettings, SendPolicy};
 use otap_df_config::pipeline::{PipelineConfig, PipelineConfigBuilder, PipelineType};
 use otap_df_config::policy::{ChannelCapacityPolicy, TelemetryPolicy};
 use otap_df_config::{DeployedPipelineKey, PipelineGroupId, PipelineId};
+use otap_df_core_nodes::exporters::arrow_exporter::ARROW_EXPORTER_URN;
 use otap_df_core_nodes::processors::batch_processor::OTAP_BATCH_PROCESSOR_URN;
 use otap_df_core_nodes::processors::retry_processor::RETRY_PROCESSOR_URN;
 use otap_df_core_nodes::receivers::traffic_generator::TRAFFIC_GENERATOR_RECEIVER_URN;
@@ -29,9 +30,13 @@ use otap_df_state::store::ObservedStateStore;
 use otap_df_telemetry::InternalTelemetrySystem;
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::Cursor;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
+
+use arrow_ipc::reader::FileReader;
 
 fn fake_receiver_config(
     max_signal_count: u64,
@@ -183,6 +188,79 @@ fn build_otlp_batch_local_wakeup_pipeline_config(
             pipeline_id.clone(),
         )
         .expect("failed to build local wakeup batch liveness pipeline config")
+}
+
+fn build_arrow_exporter_pipeline_config(
+    pipeline_group_id: &PipelineGroupId,
+    pipeline_id: &PipelineId,
+    output_directory: &Path,
+) -> PipelineConfig {
+    PipelineConfigBuilder::new()
+        .add_receiver(
+            "fake_receiver",
+            TRAFFIC_GENERATOR_RECEIVER_URN,
+            Some(json!({
+                "traffic_config": {
+                    "signals_per_second": null,
+                    "max_signal_count": 6,
+                    "max_batch_size": 2,
+                    "metric_weight": 1,
+                    "trace_weight": 1,
+                    "log_weight": 1
+                },
+                "data_source": "synthetic",
+                "enable_ack_nack": true
+            })),
+        )
+        .add_exporter(
+            "arrow_exporter",
+            ARROW_EXPORTER_URN,
+            Some(json!({
+                "storage": {
+                    "file": {
+                        "base_uri": output_directory.to_string_lossy()
+                    }
+                },
+                "retry": null,
+                "fsync": true
+            })),
+        )
+        .one_of("fake_receiver", ["arrow_exporter"])
+        .build(
+            PipelineType::Otap,
+            pipeline_group_id.clone(),
+            pipeline_id.clone(),
+        )
+        .expect("failed to build Arrow exporter pipeline config")
+}
+
+fn collect_arrow_files(directory: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let Ok(entries) = std::fs::read_dir(directory) else {
+        return files;
+    };
+
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files.extend(collect_arrow_files(&path));
+        } else if path
+            .extension()
+            .is_some_and(|extension| extension == "arrow")
+        {
+            files.push(path);
+        }
+    }
+    files
+}
+
+fn contains_signal_payload(files: &[PathBuf], signal: &str, payload: &str) -> bool {
+    let signal_component = format!("signal={signal}{}", std::path::MAIN_SEPARATOR);
+    let payload_component = format!("payload={payload}{}", std::path::MAIN_SEPARATOR);
+    files.iter().any(|path| {
+        let path = path.to_string_lossy();
+        path.contains(&signal_component) && path.contains(&payload_component)
+    })
 }
 
 fn run_pipeline_with_condition<F>(
@@ -567,4 +645,50 @@ fn test_batch_pipeline_uses_timer_wakeup_metrics_with_otlp_bytes_config() {
     metrics.assert_eq("flushes.timer", 5);
 
     counting_exporter::unregister_counter(test_id);
+}
+
+/// Scenario: Synthetic logs, metrics, and traces flow through a runtime Arrow exporter pipeline.
+/// Guarantees: Every signal root is persisted as readable Arrow IPC before pipeline shutdown.
+#[test]
+fn arrow_exporter_writes_synthetic_pipeline_traffic() {
+    let pipeline_group_id: PipelineGroupId = "integration-group".into();
+    let pipeline_id: PipelineId = "arrow-exporter-pipeline".into();
+    let output_directory = tempfile::tempdir().expect("create Arrow output directory");
+    let config = build_arrow_exporter_pipeline_config(
+        &pipeline_group_id,
+        &pipeline_id,
+        output_directory.path(),
+    );
+
+    run_pipeline_with_condition(
+        config,
+        &pipeline_group_id,
+        &pipeline_id,
+        Duration::from_secs(10),
+        Duration::from_secs(2),
+        Some({
+            let output_path = output_directory.path().to_path_buf();
+            move || {
+                let files = collect_arrow_files(&output_path);
+                contains_signal_payload(&files, "logs", "logs")
+                    && contains_signal_payload(&files, "traces", "spans")
+                    && (contains_signal_payload(&files, "metrics", "univariate_metrics")
+                        || contains_signal_payload(&files, "metrics", "multivariate_metrics"))
+            }
+        }),
+    );
+
+    let files = collect_arrow_files(output_directory.path());
+    assert!(contains_signal_payload(&files, "logs", "logs"));
+    assert!(contains_signal_payload(&files, "traces", "spans"));
+    assert!(
+        contains_signal_payload(&files, "metrics", "univariate_metrics")
+            || contains_signal_payload(&files, "metrics", "multivariate_metrics")
+    );
+    for path in files {
+        let bytes = std::fs::read(&path).expect("read exported Arrow IPC file");
+        let reader =
+            FileReader::try_new(Cursor::new(bytes), None).expect("decode exported Arrow IPC file");
+        assert_eq!(reader.count(), 1, "each object should contain one batch");
+    }
 }

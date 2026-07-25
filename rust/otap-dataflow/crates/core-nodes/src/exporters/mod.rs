@@ -1,6 +1,9 @@
 // Copyright The OpenTelemetry Authors
 // SPDX-License-Identifier: Apache-2.0
 
+/// Arrow IPC object-store exporter building blocks.
+pub mod arrow_exporter;
+
 /// Noop exporter.
 pub mod noop_exporter;
 
